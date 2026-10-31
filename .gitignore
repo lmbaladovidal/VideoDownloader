@@ -1,0 +1,18 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller build artifacts & large binaries (>100MB GitHub limit)
+build/
+dist/
+Instalador/
+*.spec
+
+# Local runtime state
+download_history.json

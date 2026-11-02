@@ -58,3 +58,4 @@ Para compilar la versión portable (`dist/YouTubeDownloader/YouTubeDownloader.ex
 ```powershell
 .\.venv\Scripts\python build_installer.py
 ```
+

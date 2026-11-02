@@ -6,11 +6,24 @@ import sys
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
+import certifi
 import requests
 import yt_dlp
 from yt_dlp.downloader.external import FFmpegFD
 from yt_dlp.utils import download_range_func, encodeArgument, Popen
 from PyQt6.QtCore import QThread, pyqtSignal
+
+
+# Ensure Windows subprocess calls inside yt-dlp (deno, ffmpeg, ffprobe) never flash console windows
+if sys.platform == "win32" and not getattr(Popen, "_no_window_patched", False):
+    _orig_yt_popen_init = Popen.__init__
+
+    def _win32_no_window_popen_init(self, args, *p_args, **p_kwargs):
+        p_kwargs["creationflags"] = p_kwargs.get("creationflags", 0) | 0x08000000
+        _orig_yt_popen_init(self, args, *p_args, **p_kwargs)
+
+    Popen.__init__ = _win32_no_window_popen_init
+    Popen._no_window_patched = True
 
 
 class DownloadCancelledError(Exception):
@@ -19,7 +32,18 @@ class DownloadCancelledError(Exception):
 
 
 def ensure_ffmpeg() -> Optional[str]:
-    """Ensure ffmpeg and ffprobe are available (checking bundled dir first, then PATH/static-ffmpeg)."""
+    """
+    Ensure ffmpeg, ffprobe, deno JS runtime, and SSL certificates are available in PATH/env
+    (checking bundled dir first for standalone .exe, then PATH / static-ffmpeg / deno package).
+    """
+    try:
+        ca_bundle = certifi.where()
+        if ca_bundle and os.path.exists(ca_bundle):
+            os.environ.setdefault("SSL_CERT_FILE", ca_bundle)
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_bundle)
+    except Exception:
+        pass
+
     candidate_dirs = []
     if getattr(sys, "frozen", False):
         meipass = getattr(sys, "_MEIPASS", None)
@@ -36,6 +60,18 @@ def ensure_ffmpeg() -> Optional[str]:
                 os.environ["PATH"] = d_str + os.pathsep + os.environ.get("PATH", "")
             return d_str
 
+    # Ensure deno JS runtime from Python deno package is on PATH in dev mode
+    if not shutil.which("deno"):
+        try:
+            import deno
+            deno_bin = deno.find_deno_bin()
+            if deno_bin and os.path.exists(deno_bin):
+                deno_dir = str(Path(deno_bin).resolve().parent)
+                if deno_dir not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = deno_dir + os.pathsep + os.environ.get("PATH", "")
+        except Exception:
+            pass
+
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
         try:
@@ -47,6 +83,41 @@ def ensure_ffmpeg() -> Optional[str]:
     if ffmpeg_path:
         return str(Path(ffmpeg_path).resolve().parent)
     return None
+
+
+def extract_info_with_fallbacks(url: str, base_opts: Dict[str, Any], download: bool) -> Any:
+    """
+    Runs yt_dlp.YoutubeDL.extract_info with resilient YouTube player_client configurations.
+    1) Default + Android (uses bundled Deno + EJS for full 4K/8K formats, plus Android fallback)
+    2) Android + iOS mobile clients (bypasses web 429 / bot-check challenges without cookies)
+    """
+    profiles = [
+        {"youtube": {"player_client": ["default", "android"]}},
+        {"youtube": {"player_client": ["android", "ios"]}},
+    ]
+    last_exc: Optional[Exception] = None
+    for idx, ext_args in enumerate(profiles):
+        opts = dict(base_opts)
+        opts["extractor_args"] = ext_args
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=download)
+                return info, ydl
+        except DownloadCancelledError:
+            raise
+        except Exception as e:
+            last_exc = e
+            err_text = str(e).lower()
+            # Retry on next profile if YouTube blocked or returned no formats
+            if idx < len(profiles) - 1 and any(
+                k in err_text
+                for k in ("bot", "sign in", "429", "no video formats", "reload", "Unable to download webpage".lower())
+            ):
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    return None, None
 
 
 def format_bytes(num_bytes: Optional[float]) -> str:
@@ -239,8 +310,7 @@ class VideoInfoWorker(QThread):
             if ffmpeg_dir:
                 ydl_opts["ffmpeg_location"] = ffmpeg_dir
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(self.url, download=False)
+            info, _ydl = extract_info_with_fallbacks(self.url, ydl_opts, download=False)
 
             if not info:
                 self.error_occurred.emit("No se pudo obtener información del video.")
@@ -658,30 +728,29 @@ class DownloadWorker(QThread):
                     postprocessor["preferredquality"] = "0"
                 ydl_opts["postprocessors"] = [postprocessor]
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(self.url, download=True)
-                if "entries" in info and info["entries"]:
-                    info = info["entries"][0]
+            info, ydl = extract_info_with_fallbacks(self.url, ydl_opts, download=True)
+            if "entries" in info and info["entries"]:
+                info = info["entries"][0]
 
-                title = info.get("title") or "Archivo descargado"
+            title = info.get("title") or "Archivo descargado"
 
-                resolved_path = self._final_filepath
-                req_downloads = info.get("requested_downloads")
-                if req_downloads and isinstance(req_downloads, list):
-                    last_dl = req_downloads[-1]
-                    if last_dl.get("filepath"):
-                        resolved_path = last_dl["filepath"]
+            resolved_path = self._final_filepath
+            req_downloads = info.get("requested_downloads")
+            if req_downloads and isinstance(req_downloads, list):
+                last_dl = req_downloads[-1]
+                if last_dl.get("filepath"):
+                    resolved_path = last_dl["filepath"]
 
-                if not resolved_path or not os.path.exists(resolved_path):
-                    prepared = Path(ydl.prepare_filename(info))
-                    target_ext = self.video_ext if self.mode == "video" else self.audio_codec
-                    candidate = prepared.with_suffix(f".{target_ext}")
-                    if candidate.exists():
-                        resolved_path = str(candidate)
-                    elif prepared.exists():
-                        resolved_path = str(prepared)
-                    else:
-                        resolved_path = str(candidate)
+            if not resolved_path or not os.path.exists(resolved_path):
+                prepared = Path(ydl.prepare_filename(info))
+                target_ext = self.video_ext if self.mode == "video" else self.audio_codec
+                candidate = prepared.with_suffix(f".{target_ext}")
+                if candidate.exists():
+                    resolved_path = str(candidate)
+                elif prepared.exists():
+                    resolved_path = str(prepared)
+                else:
+                    resolved_path = str(candidate)
 
             self.download_complete.emit(str(resolved_path), title, self.quality_summary)
 

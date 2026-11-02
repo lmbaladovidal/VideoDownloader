@@ -363,15 +363,19 @@ def main() -> None:
     icon_path = PROJECT_DIR / "app_icon.ico"
     generate_icon(icon_path)
 
-    # Locate static_ffmpeg binaries
+    # Locate static_ffmpeg and deno binaries
     import static_ffmpeg
+    import deno
     static_ffmpeg.add_paths()
     ffmpeg_exe = shutil.which("ffmpeg")
     ffprobe_exe = shutil.which("ffprobe")
+    deno_exe = deno.find_deno_bin()
     if not ffmpeg_exe or not ffprobe_exe:
         raise RuntimeError("No se encontraron los binarios de ffmpeg/ffprobe.")
+    if not deno_exe or not os.path.exists(deno_exe):
+        raise RuntimeError("No se encontró el binario de deno para yt-dlp.")
 
-    print(f"[2/4] Empaquetando aplicación principal con PyInstaller (incluyendo FFmpeg)...")
+    print(f"[2/4] Empaquetando aplicación principal con PyInstaller (incluyendo FFmpeg, Deno y EJS)...")
     pyinstaller_exe = str(PROJECT_DIR / ".venv" / "Scripts" / "pyinstaller.exe")
 
     cmd_app = [
@@ -389,6 +393,16 @@ def main() -> None:
         f"{ffmpeg_exe};ffmpeg_bin",
         "--add-binary",
         f"{ffprobe_exe};ffmpeg_bin",
+        "--add-binary",
+        f"{deno_exe};ffmpeg_bin",
+        "--collect-all",
+        "yt_dlp",
+        "--collect-all",
+        "yt_dlp_ejs",
+        "--collect-all",
+        "certifi",
+        "--collect-all",
+        "curl_cffi",
         str(PROJECT_DIR / "main.py"),
     ]
     subprocess.run(cmd_app, cwd=str(PROJECT_DIR), check=True)

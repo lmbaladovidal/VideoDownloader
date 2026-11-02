@@ -23,6 +23,7 @@ from downloader import (
     Popen,
     FFmpegFD,
     ensure_ffmpeg,
+    extract_info_with_fallbacks,
     format_bytes,
     format_duration,
     format_views,
@@ -206,6 +207,38 @@ class TestDownloadWorkerAndFFmpegWrapper(unittest.TestCase):
         worker.cancel()
         with self.assertRaises(DownloadCancelledError):
             worker._progress_hook({"status": "downloading", "downloaded_bytes": 100, "total_bytes": 1000})
+
+    def test_ensure_ffmpeg_sets_deno_and_ssl_certs(self):
+        ffmpeg_dir = ensure_ffmpeg()
+        self.assertIsNotNone(ffmpeg_dir)
+        self.assertIsNotNone(shutil.which("deno"), "Deno JS runtime must be on PATH")
+        self.assertTrue(os.path.exists(os.environ.get("SSL_CERT_FILE", "")))
+
+    def test_extract_info_with_fallbacks_retries_on_bot_error(self):
+        attempts = []
+
+        class FakeYDL:
+            def __init__(self, opts):
+                self.opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def extract_info(self, url, download=False):
+                clients = self.opts.get("extractor_args", {}).get("youtube", {}).get("player_client", [])
+                attempts.append(clients)
+                if len(attempts) == 1:
+                    raise Exception("ERROR: [youtube] Sign in to confirm you’re not a bot")
+                return {"title": "Fallback Video", "formats": []}
+
+        with patch("downloader.yt_dlp.YoutubeDL", FakeYDL):
+            info, _ydl = extract_info_with_fallbacks("https://youtube.com/watch?v=123", {}, download=False)
+            self.assertEqual(info["title"], "Fallback Video")
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(attempts[1], ["android", "ios"])
 
     def test_ffmpeg_range_popen_context_manager_does_not_raise_closed_file(self):
         """Regression test for 'readline of closed file' when Popen.__exit__ closes stderr and calls wait()."""
